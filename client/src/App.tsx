@@ -41,7 +41,7 @@ const Search = ({ className = 'h-4 w-4' }: IconProps) => (
 const Hash = ({ className = 'h-4 w-4' }: IconProps) => (
   <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="4" x2="20" y1="9" y2="9"/><line x1="4" x2="20" y1="15" y2="15"/><line x1="10" x2="8" y1="3" y2="21"/><line x1="16" x2="14" y1="3" y2="21"/></svg>
 );
-const Users = ({ className = 'h-4 w-4' }: IconProps) => (
+export const Users = ({ className = 'h-4 w-4' }: IconProps) => (
   <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
 );
 const Code2 = ({ className = 'h-4 w-4' }: IconProps) => (
@@ -111,6 +111,7 @@ export interface ChatMessage {
   senderId: string;
   senderName: string;
   senderRole: string;
+  senderHandle?: string;
   avatarGradient: string;
   senderAvatarUrl?: string;
   senderBio?: string;
@@ -156,7 +157,7 @@ export interface UserNotification {
   recipientHandle: string;
   senderId: string;
   senderName: string;
-  senderHandle: string;
+  senderHandle?: string;
   roomId: string;
   roomName: string;
   messageId: string | null;
@@ -541,7 +542,7 @@ export function App() {
   const [customMetaVal, setCustomMetaVal] = useState('');
   const [showMetaInputs, setShowMetaInputs] = useState(false);
   const [isConnected, setIsConnected] = useState(true);
-  const [typingUser, setTypingUser] = useState<string | null>(null);
+  const [typingUser, _setTypingUser] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Modular Email OTP & Magic Link Authentication State (Starts in Read-Only Guest Mode)

@@ -9,14 +9,13 @@
  */
 
 import React, { useState, useEffect, useMemo } from 'react';
-import {
+import type {
   AuthUser,
   ChatMessage,
-  Room,
-  AVATAR_PRESETS,
-  formatSmartTimestamp,
-  getInitials,
+  Room
 } from '../types';
+
+import { AVATAR_PRESETS, formatSmartTimestamp, getInitials } from '../types';
 
 export interface ProfilePageProps {
   targetUserId: string;

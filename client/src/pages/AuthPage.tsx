@@ -4,7 +4,7 @@
  */
 
 import React from 'react';
-import { OtpDevPreview } from '../types';
+import type { OtpDevPreview } from '../types';
 
 export interface AuthPageProps {
   isDark: boolean;

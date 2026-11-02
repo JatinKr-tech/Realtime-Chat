@@ -79,7 +79,7 @@ export interface UserNotification {
   recipientHandle: string;
   senderId: string;
   senderName: string;
-  senderHandle: string;
+  senderHandle?: string;
   roomId: string;
   roomName: string;
   messageId: string | null;
