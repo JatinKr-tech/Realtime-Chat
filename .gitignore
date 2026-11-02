@@ -1,0 +1,27 @@
+# 1. Dependency directories
+# Ignores root node_modules as well as nested ones in client/ and server/
+node_modules/
+*/node_modules/
+
+# 2. Production build output folders
+dist/
+*/dist/
+build/
+*/build/
+
+# 3. Environment & secrets
+.env
+.env.*
+!.env.example
+
+# 4. OS & Editor metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# 5. Logs & debuggers
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
