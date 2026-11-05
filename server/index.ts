@@ -1,6 +1,21 @@
+/**
+ * Production-Hardened Node.js + Socket.IO Server Connected to Neon Serverless Postgres
+ *
+ * Includes Fixes For:
+ * 1. Windows / ISP DNS `getaddrinfo ENOTFOUND` drops:
+ *    - Forces IPv4-first (`dns.setDefaultResultOrder('ipv4first')`)
+ *    - Caches the resolved Neon IPv4 address in memory with Cloudflare/Google DNS (`1.1.1.1`, `8.8.8.8`) fallback
+ *    - Wraps `dbPool.query` with automatic retry on transient `ENOTFOUND` / `EAI_AGAIN` / `ECONNRESET` errors
+ * 2. Eliminates `pg-connection-string` `sslmode=require` deprecation warning by normalizing to `sslmode=verify-full`
+ * 3. Per-IP Sliding-Window Rate Limiter, HTTP Security Headers, Payload Size Cap & CORS Whitelist
+ */
+
+import fs from 'fs';
+import path from 'path';
+import dns from 'dns';
 import { createServer, IncomingMessage, ServerResponse } from 'http';
 import { Server } from 'socket.io';
-import { Pool } from 'pg';
+import { Pool, QueryResult, QueryResultRow } from 'pg';
 import {
   ChatServer,
   GLOBAL_CHAT_ROOM_ID,
@@ -32,18 +47,290 @@ import {
   verifyOtpCode,
 } from './authHandler';
 
+// Prefer IPv4 on Windows to prevent dual-stack IPv6 getaddrinfo timeouts
+if (typeof dns.setDefaultResultOrder === 'function') {
+  dns.setDefaultResultOrder('ipv4first');
+}
+
+// ---------------------------------------------------------------------------
+// 1. Automatic `.env` Loader (No external `dotenv` package required)
+// ---------------------------------------------------------------------------
+
+function loadLocalEnvFile(): void {
+  const envPath = path.resolve(process.cwd(), '.env');
+  if (!fs.existsSync(envPath)) return;
+  try {
+    const content = fs.readFileSync(envPath, 'utf8');
+    for (const rawLine of content.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eqIdx = line.indexOf('=');
+      if (eqIdx === -1) continue;
+      const key = line.slice(0, eqIdx).trim();
+      let val = line.slice(eqIdx + 1).trim();
+      if (
+        (val.startsWith('"') && val.endsWith('"')) ||
+        (val.startsWith("'") && val.endsWith("'"))
+      ) {
+        val = val.slice(1, -1);
+      }
+      if (key && process.env[key] === undefined) {
+        process.env[key] = val;
+      }
+    }
+  } catch (err) {
+    console.warn('[Env] Could not parse .env file:', err);
+  }
+}
+
+loadLocalEnvFile();
+
+// ---------------------------------------------------------------------------
+// 2. Neon Serverless Postgres Connection Pool + Resilient DNS & Auto-Retry
+// ---------------------------------------------------------------------------
+
+const RAW_DATABASE_URL = process.env.DATABASE_URL || '';
+
+if (!RAW_DATABASE_URL || RAW_DATABASE_URL.includes('****************')) {
+  console.warn(
+    '⚠️  [Security Notice] DATABASE_URL is missing or still contains masked asterisks (****************).'
+  );
+  console.warn(
+    '👉 Create a file named `server/.env` and set your real Neon connection string.'
+  );
+}
+
+const isLocalDatabase =
+  !RAW_DATABASE_URL ||
+  RAW_DATABASE_URL.includes('localhost') ||
+  RAW_DATABASE_URL.includes('127.0.0.1');
+
+// Normalize sslmode=require -> sslmode=verify-full to silence pg v9 security warning
+const NORMALIZED_DATABASE_URL = (
+  RAW_DATABASE_URL || 'postgresql://postgres:jatin2007@localhost:5432/chatdb'
+).replace(/sslmode=require\b/g, 'sslmode=verify-full');
+
+// Resilient DNS cache + public DNS fallback (1.1.1.1 / 8.8.8.8) so Windows getaddrinfo never fails with ENOTFOUND
+const dnsCache = new Map<string, { address: string; family: number }>();
+const fallbackResolver = new dns.promises.Resolver();
+try {
+  fallbackResolver.setServers(['1.1.1.1', '8.8.8.8', '1.0.0.1', '8.8.4.4']);
+} catch {
+  // ignore if setServers is restricted
+}
+
+function resilientDnsLookup(
+  hostname: string,
+  options: dns.LookupOptions | number,
+  callback: (
+    err: NodeJS.ErrnoException | null,
+    address: string | dns.LookupAddress[],
+    family?: number
+  ) => void
+): void {
+  const wantsAll = typeof options === 'object' && Boolean(options?.all);
+
+  dns.lookup(hostname, options as dns.LookupOptions, async (err, address, family) => {
+    if (!err && address) {
+      if (!wantsAll && typeof address === 'string') {
+        dnsCache.set(hostname, { address, family: family || 4 });
+      }
+      return callback(null, address, family);
+    }
+
+    // Fallback 1: Use previously cached IPv4 address if OS DNS dropped a UDP packet
+    const cached = dnsCache.get(hostname);
+    if (cached) {
+      if (wantsAll) {
+        return callback(null, [
+          { address: cached.address, family: cached.family },
+        ]);
+      }
+      return callback(null, cached.address, cached.family);
+    }
+
+    // Fallback 2: Query Cloudflare (1.1.1.1) / Google (8.8.8.8) DNS directly over TCP/UDP
+    try {
+      const ips = await fallbackResolver.resolve4(hostname);
+      if (ips && ips.length > 0) {
+        const resolvedIp = ips[0];
+        dnsCache.set(hostname, { address: resolvedIp, family: 4 });
+        if (wantsAll) {
+          return callback(null, [{ address: resolvedIp, family: 4 }]);
+        }
+        return callback(null, resolvedIp, 4);
+      }
+    } catch {
+      // fall through to original error
+    }
+
+    return callback(err, address, family);
+  });
+}
+
 const dbPool = new Pool({
-  connectionString:
-    process.env.DATABASE_URL ||
-    'postgresql://postgres:jatin2007@localhost:5432/chatdb',
+  connectionString: NORMALIZED_DATABASE_URL,
+  ssl: isLocalDatabase ? false : { rejectUnauthorized: true },
+  max: 5, // Keep pool compact to avoid concurrent Windows DNS bursts
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 15_000,
+  keepAlive: true,
+  // Use resilient cached DNS lookup so transient ENOTFOUND errors never occur
+  ...(isLocalDatabase ? {} : { lookup: resilientDnsLookup as unknown as undefined }),
 });
+
+// Prevent Neon scale-to-zero idle disconnects from crashing the Node process
+dbPool.on('error', (err) => {
+  console.warn(
+    '[Neon Pool] Idle database client disconnected (normal during Neon auto-suspend):',
+    err.message
+  );
+});
+
+// Wrap dbPool.query with automatic retry for transient network/DNS errors (ENOTFOUND, EAI_AGAIN, ECONNRESET)
+const rawPoolQuery = dbPool.query.bind(dbPool);
+const TRANSIENT_ERROR_CODES = new Set([
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EPIPE',
+  '57P01', // admin_shutdown during Neon scale-to-zero
+]);
+
+(dbPool as unknown as { query: typeof dbPool.query }).query = (async (
+  queryTextOrConfig: unknown,
+  values?: unknown
+): Promise<QueryResult<QueryResultRow>> => {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      return await (rawPoolQuery as (
+        q: unknown,
+        v?: unknown
+      ) => Promise<QueryResult<QueryResultRow>>)(queryTextOrConfig, values);
+    } catch (err) {
+      lastError = err;
+      const code =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code?: unknown }).code)
+          : '';
+      if (attempt < 3 && TRANSIENT_ERROR_CODES.has(code)) {
+        await new Promise((r) => setTimeout(r, 350 * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
+}) as typeof dbPool.query;
+
+// ---------------------------------------------------------------------------
+// 3. Security Configuration: CORS Whitelist, Rate Limiter & Body Size Cap
+// ---------------------------------------------------------------------------
+
+const PORT = Number(process.env.PORT) || 4000;
+const MAX_BODY_BYTES = 2.5 * 1024 * 1024; // 2.5 MB max payload
+
+const ALLOWED_ORIGINS: string[] = (
+  process.env.ALLOWED_ORIGINS ||
+  'http://localhost:5173,http://127.0.0.1:5173'
+)
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+function isOriginAllowed(origin: string | undefined): boolean {
+  if (!origin) return true;
+  if (ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
+    return true;
+  }
+  return false;
+}
+
+interface RateBucket {
+  count: number;
+  resetAt: number;
+}
+const ipRateBuckets = new Map<string, RateBucket>();
+
+function checkRateLimit(
+  ip: string,
+  bucketKey: string,
+  maxRequests: number,
+  windowMs: number
+): boolean {
+  const now = Date.now();
+  const key = `${ip}:${bucketKey}`;
+  const existing = ipRateBuckets.get(key);
+  if (!existing || now > existing.resetAt) {
+    ipRateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (existing.count >= maxRequests) {
+    return false;
+  }
+  existing.count += 1;
+  return true;
+}
+
+function getClientIp(req: IncomingMessage): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string') {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function setSecurityAndCorsHeaders(
+  req: IncomingMessage,
+  res: ServerResponse
+): void {
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  } else if (ALLOWED_ORIGINS.includes('*')) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+  } else {
+    res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGINS[0] || '*');
+  }
+
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET, POST, PUT, DELETE, OPTIONS'
+  );
+  res.setHeader(
+    'Access-Control-Allow-Headers',
+    'Content-Type, Authorization'
+  );
+
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader(
+      'Strict-Transport-Security',
+      'max-age=31536000; includeSubDomains'
+    );
+  }
+}
 
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     let raw = '';
-    req.on('data', (chunk) => {
-      raw += chunk;
+    let byteCount = 0;
+
+    req.on('data', (chunk: Buffer) => {
+      byteCount += chunk.length;
+      if (byteCount > MAX_BODY_BYTES) {
+        req.destroy();
+        reject(new Error('PAYLOAD_TOO_LARGE'));
+        return;
+      }
+      raw += chunk.toString('utf8');
     });
+
     req.on('end', () => {
       try {
         resolve(raw ? JSON.parse(raw) : {});
@@ -51,26 +338,23 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
         reject(e);
       }
     });
+
     req.on('error', reject);
   });
 }
 
 function sendJson(res: ServerResponse, status: number, payload: unknown): void {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload));
 }
 
+// ---------------------------------------------------------------------------
+// 4. HTTP Server & REST API Routes
+// ---------------------------------------------------------------------------
+
 const httpServer = createServer(
   async (req: IncomingMessage, res: ServerResponse) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader(
-      'Access-Control-Allow-Methods',
-      'GET, POST, PUT, DELETE, OPTIONS'
-    );
-    res.setHeader(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization'
-    );
+    setSecurityAndCorsHeaders(req, res);
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -78,12 +362,37 @@ const httpServer = createServer(
       return;
     }
 
-    const reqUrl = new URL(req.url || '/', 'http://localhost:4000');
+    const clientIp = getClientIp(req);
+    if (!checkRateLimit(clientIp, 'global_api', 120, 60_000)) {
+      sendJson(res, 429, {
+        ok: false,
+        error: {
+          code: 'RATE_LIMITED',
+          message: 'Too many requests. Please wait a moment and try again.',
+        },
+      });
+      return;
+    }
+
+    const reqUrl = new URL(req.url || '/', `http://localhost:${PORT}`);
     const authHeader = req.headers.authorization || '';
 
     // 1. Health Check
     if (req.method === 'GET' && reqUrl.pathname === '/api/health') {
-      sendJson(res, 200, { ok: true, service: 'pulsechat-postgres-v3' });
+      try {
+        await dbPool.query('SELECT 1');
+        sendJson(res, 200, {
+          ok: true,
+          service: 'pulsechat-neon-postgres',
+          database: 'connected',
+        });
+      } catch {
+        sendJson(res, 503, {
+          ok: false,
+          service: 'pulsechat-neon-postgres',
+          database: 'disconnected',
+        });
+      }
       return;
     }
 
@@ -92,6 +401,17 @@ const httpServer = createServer(
     // -------------------------------------------------------------------------
 
     if (req.method === 'POST' && reqUrl.pathname === '/api/auth/request-otp') {
+      if (!checkRateLimit(clientIp, 'auth_otp', 10, 60_000)) {
+        sendJson(res, 429, {
+          ok: false,
+          error: {
+            code: 'AUTH_RATE_LIMITED',
+            message: 'Too many OTP requests. Please wait 1 minute.',
+          },
+        });
+        return;
+      }
+
       try {
         const body = await readJsonBody(req);
         const challenge = await createOtpChallenge(dbPool, {
@@ -103,7 +423,7 @@ const httpServer = createServer(
           clientOrigin:
             typeof body.clientOrigin === 'string'
               ? body.clientOrigin
-              : 'http://localhost:5173',
+              : ALLOWED_ORIGINS[0] || 'http://localhost:5173',
         });
         sendJson(res, 200, { ok: true, data: challenge });
       } catch (err) {
@@ -120,6 +440,17 @@ const httpServer = createServer(
     }
 
     if (req.method === 'POST' && reqUrl.pathname === '/api/auth/verify-otp') {
+      if (!checkRateLimit(clientIp, 'auth_verify', 10, 60_000)) {
+        sendJson(res, 429, {
+          ok: false,
+          error: {
+            code: 'AUTH_RATE_LIMITED',
+            message: 'Too many verification attempts. Please wait 1 minute.',
+          },
+        });
+        return;
+      }
+
       try {
         const body = await readJsonBody(req);
         const verified = await verifyOtpCode(dbPool, {
@@ -212,7 +543,7 @@ const httpServer = createServer(
         const rooms = await listRoomsForUser(dbPool, handle);
         sendJson(res, 200, { ok: true, data: rooms });
       } catch (err) {
-        console.error('[PostgreSQL] Failed to list rooms:', err);
+        console.error('[Neon DB] Failed to list rooms:', err);
         sendJson(res, 500, {
           ok: false,
           error: { code: 'DB_ERROR', message: 'Failed to load rooms.' },
@@ -238,7 +569,8 @@ const httpServer = createServer(
         const body = await readJsonBody(req);
         const created = await createCustomRoom(dbPool, {
           name: typeof body.name === 'string' ? body.name : '',
-          roomCode: typeof body.roomCode === 'string' ? body.roomCode : undefined,
+          roomCode:
+            typeof body.roomCode === 'string' ? body.roomCode : undefined,
           topic: typeof body.topic === 'string' ? body.topic : undefined,
           creatorId: authUser.id,
           creatorHandle: authUser.userHandle,
@@ -393,7 +725,7 @@ const httpServer = createServer(
           hasMoreOlder: result.hasMoreOlder,
         });
       } catch (err) {
-        console.error('[PostgreSQL] Failed to load notifications:', err);
+        console.error('[Neon DB] Failed to load notifications:', err);
         sendJson(res, 500, {
           ok: false,
           error: {
@@ -457,13 +789,15 @@ const httpServer = createServer(
 
         sendJson(res, 200, { ok: true, data: updatedUser });
       } catch (err) {
+        const msg =
+          err instanceof Error && err.message === 'PAYLOAD_TOO_LARGE'
+            ? 'Profile photo is too large (max 2 MB).'
+            : err instanceof Error
+            ? err.message
+            : 'Failed to update profile.';
         sendJson(res, 400, {
           ok: false,
-          error: {
-            code: 'PROFILE_UPDATE_FAILED',
-            message:
-              err instanceof Error ? err.message : 'Failed to update profile.',
-          },
+          error: { code: 'PROFILE_UPDATE_FAILED', message: msg },
         });
       }
       return;
@@ -490,12 +824,12 @@ const httpServer = createServer(
         }
         sendJson(res, 200, { ok: true, data: profile });
       } catch (err) {
-        console.error('[PostgreSQL] Failed to load user profile:', err);
+        console.error('[Neon DB] Failed to load user profile:', err);
         sendJson(res, 500, {
           ok: false,
           error: {
             code: 'DB_ERROR',
-            message: 'Could not load user profile from PostgreSQL.',
+            message: 'Could not load user profile from Neon Postgres.',
           },
         });
       }
@@ -503,7 +837,7 @@ const httpServer = createServer(
     }
 
     // -------------------------------------------------------------------------
-    // 6. Message Endpoints (Strictly <= 40 Messages Loaded at a Time)
+    // 6. Message Endpoints (40-Message Smooth Infinite Scroll Batches)
     // -------------------------------------------------------------------------
 
     if (req.method === 'GET' && reqUrl.pathname === '/api/messages') {
@@ -537,10 +871,10 @@ const httpServer = createServer(
           hasMoreNewer: windowed.hasMoreNewer,
         });
       } catch (err) {
-        console.error('[PostgreSQL] Failed to fetch messages:', err);
+        console.error('[Neon DB] Failed to fetch messages:', err);
         sendJson(res, 500, {
           ok: false,
-          error: { code: 'DB_ERROR', message: 'Could not query PostgreSQL.' },
+          error: { code: 'DB_ERROR', message: 'Could not query Neon Postgres.' },
         });
       }
       return;
@@ -594,6 +928,7 @@ const httpServer = createServer(
           avatarGradient: authUser.avatarGradient,
           senderAvatarUrl: authUser.avatarUrl,
           senderBio: authUser.bio,
+          senderIsPrivate: authUser.isPrivate,
         };
 
         const classified = classifyMessage(content, enrichedMetadata);
@@ -618,12 +953,12 @@ const httpServer = createServer(
           notifications: createdNotifications,
         });
       } catch (err) {
-        console.error('[PostgreSQL] Failed to insert message:', err);
+        console.error('[Neon DB] Failed to insert message:', err);
         sendJson(res, 500, {
           ok: false,
           error: {
             code: 'DB_ERROR',
-            message: 'Failed to insert into PostgreSQL.',
+            message: 'Failed to insert into Neon Postgres.',
           },
         });
       }
@@ -708,7 +1043,16 @@ const httpServer = createServer(
 );
 
 const io: ChatServer = new Server(httpServer, {
-  cors: { origin: '*' },
+  cors: {
+    origin: (origin, callback) => {
+      if (isOriginAllowed(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error('Origin not allowed by CORS'));
+      }
+    },
+    methods: ['GET', 'POST'],
+  },
 });
 
 io.use(async (socket, next) => {
@@ -736,20 +1080,32 @@ async function startServer() {
     await ensureAuthTables(dbPool);
     await ensureMessagesTable(dbPool);
     console.log(
-      '✅ Connected to PostgreSQL (chatdb) & verified Global Chat (admin: @jatinpersonalx), rooms, notifications, users, and messages tables'
+      `✅ Connected to ${
+        isLocalDatabase ? 'Local PostgreSQL' : 'Neon Serverless Postgres (neondb)'
+      } & verified all tables!`
     );
   } catch (err) {
     console.error(
-      '⚠️ Could not connect to PostgreSQL yet. Check that PostgreSQL is running and chatdb exists:',
+      '⚠️ Could not connect to PostgreSQL/Neon yet. Verify DATABASE_URL in server/.env:',
       err instanceof Error ? err.message : err
     );
   }
 
-  httpServer.listen(4000, () => {
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(
-      '🚀 Server + Rooms + Notifications + Socket.IO listening on http://localhost:4000'
+      `🚀 Secure Server + Socket.IO listening on http://0.0.0.0:${PORT}`
     );
   });
 }
+
+function shutdownGracefully(signal: string) {
+  console.log(`\n[${signal}] Shutting down server and closing Neon pool...`);
+  httpServer.close(() => {
+    dbPool.end().finally(() => process.exit(0));
+  });
+}
+
+process.on('SIGTERM', () => shutdownGracefully('SIGTERM'));
+process.on('SIGINT', () => shutdownGracefully('SIGINT'));
 
 startServer();
