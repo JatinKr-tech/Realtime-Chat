@@ -110,73 +110,83 @@ const NORMALIZED_DATABASE_URL = (
   RAW_DATABASE_URL || 'postgresql://postgres:jatin2007@localhost:5432/chatdb'
 ).replace(/sslmode=require\b/g, 'sslmode=verify-full');
 
-// Resilient DNS cache + public DNS fallback (1.1.1.1 / 8.8.8.8) so Windows getaddrinfo never fails with ENOTFOUND
-const dnsCache = new Map<string, { address: string; family: number }>();
+// Resilient DNS Cache & Google (8.8.8.8) / Cloudflare (1.1.1.1) Public Fallback
+// Windows getaddrinfo intermittently drops UDP packets for long AWS/Neon hostnames.
+// Monkey-patching dns.lookup at the Node engine level intercepts all pg & net.connect sockets.
+const originalDnsLookup = dns.lookup.bind(dns);
+const dnsCache = new Map<string, string>();
 const fallbackResolver = new dns.promises.Resolver();
 try {
-  fallbackResolver.setServers(['1.1.1.1', '8.8.8.8', '1.0.0.1', '8.8.4.4']);
+  fallbackResolver.setServers(['8.8.8.8', '1.1.1.1', '8.8.4.4', '1.0.0.1']);
 } catch {
-  // ignore if setServers is restricted
+  // ignore
 }
 
-function resilientDnsLookup(
+(dns as unknown as { lookup: typeof dns.lookup }).lookup = function (
   hostname: string,
-  options: dns.LookupOptions | number,
-  callback: (
-    err: NodeJS.ErrnoException | null,
-    address: string | dns.LookupAddress[],
-    family?: number
-  ) => void
-): void {
-  const wantsAll = typeof options === 'object' && Boolean(options?.all);
+  options: any,
+  callback?: any
+) {
+  let cb = callback;
+  let opts = options;
+  if (typeof options === 'function') {
+    cb = options;
+    opts = {};
+  } else if (typeof options === 'number') {
+    opts = { family: options };
+  } else if (!opts) {
+    opts = {};
+  }
 
-  dns.lookup(hostname, options as dns.LookupOptions, async (err, address, family) => {
+  // 1. Return from in-memory cache instantly (zero Windows getaddrinfo delay/failures)
+  const cachedIp = dnsCache.get(hostname);
+  if (cachedIp) {
+    if (opts && opts.all) {
+      return process.nextTick(() =>
+        cb(null, [{ address: cachedIp, family: 4 }])
+      );
+    }
+    return process.nextTick(() => cb(null, cachedIp, 4));
+  }
+
+  // 2. Try OS default resolver
+  originalDnsLookup(hostname, opts, async (err: any, address: any, family: any) => {
     if (!err && address) {
-      if (!wantsAll && typeof address === 'string') {
-        dnsCache.set(hostname, { address, family: family || 4 });
+      if (typeof address === 'string') {
+        dnsCache.set(hostname, address);
       }
-      return callback(null, address, family);
+      return cb(null, address, family);
     }
 
-    // Fallback 1: Use previously cached IPv4 address if OS DNS dropped a UDP packet
-    const cached = dnsCache.get(hostname);
-    if (cached) {
-      if (wantsAll) {
-        return callback(null, [
-          { address: cached.address, family: cached.family },
-        ]);
-      }
-      return callback(null, cached.address, cached.family);
-    }
-
-    // Fallback 2: Query Cloudflare (1.1.1.1) / Google (8.8.8.8) DNS directly over TCP/UDP
+    // 3. Fallback: If Windows returns ENOTFOUND / EAI_AGAIN, query 8.8.8.8 & 1.1.1.1 directly
     try {
       const ips = await fallbackResolver.resolve4(hostname);
       if (ips && ips.length > 0) {
         const resolvedIp = ips[0];
-        dnsCache.set(hostname, { address: resolvedIp, family: 4 });
-        if (wantsAll) {
-          return callback(null, [{ address: resolvedIp, family: 4 }]);
+        dnsCache.set(hostname, resolvedIp);
+        if (opts && opts.all) {
+          return cb(
+            null,
+            ips.map((ip) => ({ address: ip, family: 4 }))
+          );
         }
-        return callback(null, resolvedIp, 4);
+        return cb(null, resolvedIp, 4);
       }
     } catch {
-      // fall through to original error
+      // Fallback failed
     }
 
-    return callback(err, address, family);
+    return cb(err, address, family);
   });
-}
+} as typeof dns.lookup;
 
 const dbPool = new Pool({
   connectionString: NORMALIZED_DATABASE_URL,
   ssl: isLocalDatabase ? false : { rejectUnauthorized: true },
-  max: 5, // Keep pool compact to avoid concurrent Windows DNS bursts
+  max: 5,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 15_000,
   keepAlive: true,
-  // Use resilient cached DNS lookup so transient ENOTFOUND errors never occur
-  ...(isLocalDatabase ? {} : { lookup: resilientDnsLookup as unknown as undefined }),
 });
 
 // Prevent Neon scale-to-zero idle disconnects from crashing the Node process
@@ -1077,6 +1087,24 @@ io.on('connection', (socket) => {
 
 async function startServer() {
   try {
+    // Proactively pre-resolve the Neon hostname via 8.8.8.8/1.1.1.1 and cache the IP
+    if (!isLocalDatabase) {
+      try {
+        const parsed = new URL(NORMALIZED_DATABASE_URL);
+        if (parsed.hostname) {
+          const ips = await fallbackResolver.resolve4(parsed.hostname);
+          if (ips && ips.length > 0) {
+            dnsCache.set(parsed.hostname, ips[0]);
+            console.log(
+              `📡 [DNS Ready] Pre-resolved Neon host ${parsed.hostname} -> ${ips[0]} via Google/Cloudflare DNS`
+            );
+          }
+        }
+      } catch (dnsErr) {
+        console.warn('⚠️ [DNS Pre-resolve Notice]:', dnsErr);
+      }
+    }
+
     await ensureAuthTables(dbPool);
     await ensureMessagesTable(dbPool);
     console.log(
