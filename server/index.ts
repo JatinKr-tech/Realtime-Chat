@@ -255,6 +255,20 @@ function isOriginAllowed(origin: string | undefined): boolean {
   if (ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
     return true;
   }
+  // Automatically allow Vercel deployments (*.vercel.app), Render (*.onrender.com), and localhost
+  try {
+    const u = new URL(origin);
+    if (
+      u.hostname.endsWith('.vercel.app') ||
+      u.hostname.endsWith('.onrender.com') ||
+      u.hostname === 'localhost' ||
+      u.hostname === '127.0.0.1'
+    ) {
+      return true;
+    }
+  } catch {
+    // ignore malformed origin
+  }
   return false;
 }
 
@@ -386,6 +400,27 @@ const httpServer = createServer(
 
     const reqUrl = new URL(req.url || '/', `http://localhost:${PORT}`);
     const authHeader = req.headers.authorization || '';
+
+    // 0. Root & HEAD Port-Scan Responder (Required by Render HTTP Port Scanner on 0.0.0.0:10000)
+    if (
+      req.method === 'HEAD' ||
+      (req.method === 'GET' &&
+        (reqUrl.pathname === '/' || reqUrl.pathname === '/healthz'))
+    ) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      if (req.method === 'HEAD') {
+        res.end();
+      } else {
+        res.end(
+          JSON.stringify({
+            ok: true,
+            service: 'pulsechat-neon-render-backend',
+            status: 'live',
+          })
+        );
+      }
+      return;
+    }
 
     // 1. Health Check
     if (req.method === 'GET' && reqUrl.pathname === '/api/health') {
@@ -1049,6 +1084,15 @@ const httpServer = createServer(
       }
       return;
     }
+
+    // Fallback 404 so unmatched routes never hang open on Render
+    sendJson(res, 404, {
+      ok: false,
+      error: {
+        code: 'NOT_FOUND',
+        message: `Route ${req.method} ${reqUrl.pathname} not found.`,
+      },
+    });
   }
 );
 
@@ -1119,12 +1163,14 @@ async function startServer() {
     );
   }
 
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(
-      `🚀 Secure Server + Socket.IO listening on http://0.0.0.0:${PORT}`
-    );
-  });
 }
+
+// Bind HTTP port immediately on startup so Render detects the open port on 0.0.0.0 without waiting for Neon cold-start
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(
+    `🚀 Secure Server + Socket.IO listening on http://0.0.0.0:${PORT}`
+  );
+});
 
 function shutdownGracefully(signal: string) {
   console.log(`\n[${signal}] Shutting down server and closing Neon pool...`);

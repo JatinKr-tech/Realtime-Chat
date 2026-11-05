@@ -41,7 +41,7 @@ const Search = ({ className = 'h-4 w-4' }: IconProps) => (
 const Hash = ({ className = 'h-4 w-4' }: IconProps) => (
   <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="4" x2="20" y1="9" y2="9"/><line x1="4" x2="20" y1="15" y2="15"/><line x1="10" x2="8" y1="3" y2="21"/><line x1="16" x2="14" y1="3" y2="21"/></svg>
 );
-export const Users = ({ className = 'h-4 w-4' }: IconProps) => (
+const Users = ({ className = 'h-4 w-4' }: IconProps) => (
   <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
 );
 const Code2 = ({ className = 'h-4 w-4' }: IconProps) => (
@@ -111,7 +111,6 @@ export interface ChatMessage {
   senderId: string;
   senderName: string;
   senderRole: string;
-  senderHandle?: string;
   avatarGradient: string;
   senderAvatarUrl?: string;
   senderBio?: string;
@@ -157,7 +156,7 @@ export interface UserNotification {
   recipientHandle: string;
   senderId: string;
   senderName: string;
-  senderHandle?: string;
+  senderHandle: string;
   roomId: string;
   roomName: string;
   messageId: string | null;
@@ -282,6 +281,22 @@ function classifyClientMessage(
 // ---------------------------------------------------------------------------
 
 const MAX_PAGE_SIZE = 40;
+const DEFAULT_API_BASE_URL =
+  typeof window !== 'undefined' &&
+  (window.location.hostname === 'localhost' ||
+    window.location.hostname === '127.0.0.1')
+    ? 'http://localhost:4000'
+    : 'https://realtime-chat-r1gi.onrender.com';
+
+const API_BASE_URL = (
+  (import.meta as unknown as { env?: Record<string, string> })?.env
+    ?.VITE_API_URL || DEFAULT_API_BASE_URL
+).replace(/\/+$/, '');
+
+function apiFetch(endpoint: string, options?: RequestInit): Promise<Response> {
+  const targetUrl = API_BASE_URL + endpoint;
+  return fetch(targetUrl, options);
+}
 
 function sanitizeHandle(raw: string): string {
   return raw
@@ -542,7 +557,7 @@ export function App() {
   const [customMetaVal, setCustomMetaVal] = useState('');
   const [showMetaInputs, setShowMetaInputs] = useState(false);
   const [isConnected, setIsConnected] = useState(true);
-  const [typingUser, _setTypingUser] = useState<string | null>(null);
+  const [typingUser, setTypingUser] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   // Modular Email OTP & Magic Link Authentication State (Starts in Read-Only Guest Mode)
@@ -640,8 +655,7 @@ export function App() {
     async function syncRoomsAndNotifications() {
       try {
         const handleParam = authUser?.userHandle || '';
-        const roomsRes = await fetch(
-          `http://localhost:4000/api/rooms?userHandle=${encodeURIComponent(
+        const roomsRes = await apiFetch(`/api/rooms?userHandle=${encodeURIComponent(
             handleParam
           )}`,
           {
@@ -664,8 +678,7 @@ export function App() {
         }
 
         if (handleParam) {
-          const notifRes = await fetch(
-            `http://localhost:4000/api/notifications?userHandle=${encodeURIComponent(
+          const notifRes = await apiFetch(`/api/notifications?userHandle=${encodeURIComponent(
               handleParam
             )}&limit=${MAX_PAGE_SIZE}`,
             {
@@ -706,8 +719,7 @@ export function App() {
       if (opts?.before) qs.set('before', opts.before);
       if (opts?.after) qs.set('after', opts.after);
 
-      const res = await fetch(
-        `http://localhost:4000/api/messages?${qs.toString()}`
+      const res = await apiFetch(`/api/messages?${qs.toString()}`
       );
       if (!res.ok) return;
       const json = await res.json();
@@ -1244,7 +1256,7 @@ export function App() {
     };
 
     try {
-      const res = await fetch('http://localhost:4000/api/users/profile', {
+      const res = await apiFetch(`/api/users/profile`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -1383,8 +1395,7 @@ export function App() {
     setEditingMessageContent('');
 
     try {
-      const res = await fetch(
-        `http://localhost:4000/api/messages/${encodeURIComponent(msgId)}`,
+      const res = await apiFetch(`/api/messages/${encodeURIComponent(msgId)}`,
         {
           method: 'PUT',
           headers: {
@@ -1419,8 +1430,7 @@ export function App() {
     setDeletingMessageId(null);
 
     try {
-      await fetch(
-        `http://localhost:4000/api/messages/${encodeURIComponent(msgId)}`,
+      await apiFetch(`/api/messages/${encodeURIComponent(msgId)}`,
         {
           method: 'DELETE',
           headers: {
@@ -1511,7 +1521,7 @@ export function App() {
     setAuthError(null);
 
     try {
-      const res = await fetch('http://localhost:4000/api/auth/request-otp', {
+      const res = await apiFetch(`/api/auth/request-otp`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1557,7 +1567,7 @@ export function App() {
     setAuthError(null);
 
     try {
-      const res = await fetch('http://localhost:4000/api/auth/verify-otp', {
+      const res = await apiFetch(`/api/auth/verify-otp`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1619,8 +1629,7 @@ export function App() {
     setAuthError(null);
 
     try {
-      const res = await fetch(
-        'http://localhost:4000/api/auth/verify-magic-link',
+      const res = await apiFetch(`/api/auth/verify-magic-link`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1675,7 +1684,7 @@ export function App() {
   const handleLogout = async () => {
     if (sessionToken) {
       try {
-        await fetch('http://localhost:4000/api/auth/logout', {
+        await apiFetch(`/api/auth/logout`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${sessionToken}` },
         });
@@ -1748,7 +1757,7 @@ export function App() {
       `Admin: @${myHandle} • Invite members by typing: invite @userID y`;
 
     try {
-      const res = await fetch('http://localhost:4000/api/rooms', {
+      const res = await apiFetch(`/api/rooms`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -1814,8 +1823,7 @@ export function App() {
     }
 
     try {
-      const res = await fetch(
-        `http://localhost:4000/api/rooms/${encodeURIComponent(
+      const res = await apiFetch(`/api/rooms/${encodeURIComponent(
           activeRoom.id
         )}/co-admin`,
         {
@@ -1859,8 +1867,7 @@ export function App() {
     }
 
     try {
-      await fetch(
-        `http://localhost:4000/api/rooms/${encodeURIComponent(roomIdToDelete)}`,
+      await apiFetch(`/api/rooms/${encodeURIComponent(roomIdToDelete)}`,
         {
           method: 'DELETE',
           headers: sessionToken
@@ -1882,8 +1889,7 @@ export function App() {
   // Accept an invitation to join a room
   const handleAcceptRoomInvite = async (roomIdToJoin: string) => {
     try {
-      await fetch(
-        `http://localhost:4000/api/rooms/${encodeURIComponent(
+      await apiFetch(`/api/rooms/${encodeURIComponent(
           roomIdToJoin
         )}/join`,
         {
@@ -1945,7 +1951,7 @@ export function App() {
     );
     if (sessionToken) {
       try {
-        await fetch('http://localhost:4000/api/notifications/read', {
+        await apiFetch(`/api/notifications/read`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${sessionToken}` },
         });
@@ -2066,8 +2072,8 @@ export function App() {
     setCustomMetaKey('');
     setCustomMetaVal('');
 
-    // Send to Node.js + PostgreSQL server (`http://localhost:4000/api/messages`) with Bearer token
-    fetch('http://localhost:4000/api/messages', {
+    // Send to Node.js + PostgreSQL server (`${API_BASE_URL}/api/messages`) with Bearer token
+    apiFetch(`/api/messages`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
